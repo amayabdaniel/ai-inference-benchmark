@@ -9,6 +9,7 @@ Measures latency, throughput, cost, and GPU utilization.
 import argparse
 import json
 import os
+import re
 import statistics
 import sys
 import time
@@ -19,6 +20,31 @@ from pathlib import Path
 from typing import Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
+
+
+# Cap on response body read from the inference endpoint. Prevents a
+# rogue or misbehaving endpoint from making this script allocate an
+# unbounded body into memory (e.g. --endpoint pointed at a URL that
+# streams gigabytes). 8 MiB is 100x the largest legitimate chat
+# completion response (~64 KiB for a max_tokens=4096 reply with
+# metadata) — a legitimate response cannot come close.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+# Character set allowed in the model-name portion of an output filename.
+# Anything else is squashed to `-`. Prevents `--model "../../etc/passwd"`
+# from producing a path that escapes --output. The set is deliberately
+# narrower than the OCI ref grammar because it must be filesystem-safe
+# on every platform the results are ever copied to.
+_SAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def safe_filename_segment(s: str) -> str:
+    """Return `s` with any character not in [A-Za-z0-9._-] replaced by `-`,
+    and any leading dots stripped. The dot-strip prevents an all-`.` input
+    from producing `.` or `..` — either of which resolves to the parent
+    directory when used as a path segment."""
+    out = _SAFE_FILENAME_CHARS.sub("-", s).lstrip(".")
+    return out or "unnamed"
 
 
 @dataclass
@@ -117,7 +143,18 @@ def make_request(endpoint: str, model: str, prompt: str, max_tokens: int = 128) 
     try:
         with urlopen(req, timeout=120) as resp:
             first_byte = time.perf_counter()
-            body = resp.read()
+            # Read up to MAX_RESPONSE_BYTES + 1 so we can detect
+            # truncation: if we get exactly the cap back, the body was
+            # at least that long and we should fail this request rather
+            # than pretend it succeeded on a truncated JSON parse.
+            body = resp.read(MAX_RESPONSE_BYTES + 1)
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise ValueError(
+                    f"response body exceeded {MAX_RESPONSE_BYTES} bytes; "
+                    "refusing to allocate more — either the endpoint is "
+                    "misbehaving or MAX_RESPONSE_BYTES needs to be raised "
+                    "with a documented reason"
+                )
             end = time.perf_counter()
 
             data = json.loads(body)
@@ -133,7 +170,7 @@ def make_request(endpoint: str, model: str, prompt: str, max_tokens: int = 128) 
 
             result.success = True
 
-    except (URLError, TimeoutError, json.JSONDecodeError) as e:
+    except (URLError, TimeoutError, json.JSONDecodeError, ValueError) as e:
         end = time.perf_counter()
         result.success = False
         result.error = str(e)
@@ -331,12 +368,33 @@ def run_benchmark(args):
         results.append(bench)
         print_result(bench)
 
-    # Save results
+    # Save results.
+    # Every segment of the filename goes through safe_filename_segment to
+    # prevent a --model / --engine / --gpu-type flag containing `/` or
+    # `..` from escaping the --output directory. The previous code only
+    # stripped `:` from the model name, which left every other
+    # path-relevant character live. Not exploitable if the operator
+    # only passes model names they trust, but a script that feeds
+    # inputs from a config file could silently write outside the
+    # intended results dir.
     if args.output:
-        output_dir = Path(args.output)
+        output_dir = Path(args.output).resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{args.model.replace(':', '-')}_{args.engine}_{args.gpu_type}.json"
-        output_path = output_dir / filename
+        filename = (
+            f"{safe_filename_segment(args.model)}"
+            f"_{safe_filename_segment(args.engine)}"
+            f"_{safe_filename_segment(args.gpu_type)}.json"
+        )
+        output_path = (output_dir / filename).resolve()
+        # Belt-and-suspenders: after resolving, verify the final path is
+        # still under output_dir. safe_filename_segment already prevents
+        # `/` and `..`, but this guarantees the containment invariant
+        # even if a future edit weakens the sanitiser.
+        if output_dir not in output_path.parents:
+            raise SystemExit(
+                f"refusing to write outside --output directory: "
+                f"{output_path} not under {output_dir}"
+            )
         with open(output_path, "w") as f:
             json.dump([asdict(r) for r in results], f, indent=2)
         print(f"\nResults saved to {output_path}")
