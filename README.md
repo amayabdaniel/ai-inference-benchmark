@@ -117,7 +117,19 @@ We use a fixed prompt dataset for reproducibility:
 
 - GCP account with GPU quota (or use gpu-lab Terraform)
 - Docker + NVIDIA Container Toolkit on the target machine
-- Python 3.10+ for analysis
+- Python 3.10+ (for `list[T]` PEP 585 generics used in `run_benchmark.py`)
+
+### Dependencies
+
+`scripts/run_benchmark.py` is **stdlib-only by design** — it uses only
+`argparse`, `json`, `re`, `statistics`, `time`, `concurrent.futures`,
+`dataclasses`, `datetime`, `pathlib`, `typing`, `urllib`. There is no
+`requirements.txt`, `pyproject.toml`, or `setup.py`, and this is
+deliberate: a benchmark script that has to bootstrap its own Python
+environment before it can measure anything is a benchmark script that
+measures the wrong thing. Any change that adds a third-party import
+should also state why the stdlib version wasn't enough, and add the
+matching pin.
 
 ### Quick start
 
@@ -138,13 +150,26 @@ python3 scripts/run_benchmark.py \
   --engine vllm \
   --workload all \
   --output results/
-
-# Run the full matrix (takes ~2-4 hours per GPU type)
-python3 scripts/run_matrix.py --gpu-type L4 --output results/
-
-# Analyze results
-python3 scripts/analyze.py --input results/ --output analysis/
 ```
+
+Matrix drivers (`run_matrix.py`, `analyze.py`) referenced in earlier
+drafts are not yet in the repo — for a full sweep, invoke
+`run_benchmark.py` per configuration and aggregate the JSON files from
+`results/`. When a matrix driver is added, it will also be stdlib-only.
+
+### Running tests
+
+The security-critical helpers in `run_benchmark.py` are covered by
+`scripts/test_run_benchmark.py` (11 cases, stdlib `unittest`):
+
+```bash
+python3 -m unittest scripts.test_run_benchmark -v
+```
+
+The suite pins the filename-sanitiser containment property (arbitrary
+`--model` / `--engine` / `--gpu-type` values cannot escape `--output`)
+and the response-body cap (a rogue endpoint returning >8 MiB is
+refused, not silently truncated).
 
 ### Tear down
 
