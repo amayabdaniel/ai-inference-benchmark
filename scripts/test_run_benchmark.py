@@ -92,6 +92,61 @@ class SafeFilenameSegmentTests(unittest.TestCase):
             rb.safe_filename_segment("model_v1.2.3-base"), "model_v1.2.3-base"
         )
 
+    def test_empty_string_returns_unnamed(self):
+        # Reaches the `or "unnamed"` fallback: no regex substitutions
+        # fire, .lstrip(".") returns "". The fallback exists so an
+        # empty --model doesn't produce an empty output filename (which
+        # would crash the JSON writer with a directory-vs-file error).
+        self.assertEqual(rb.safe_filename_segment(""), "unnamed")
+
+    def test_control_characters_neutralised(self):
+        # A newline, tab, or NUL in --model arriving from a shell heredoc
+        # or an automated feeder must not reach the output filename or a
+        # log line — some filesystems, log pipelines, and terminal
+        # sessions do surprising things with these bytes (log injection
+        # via embedded CR/LF, ANSI-escape smuggling, filesystem quirks).
+        # The property we assert: after sanitisation, every character is
+        # printable ASCII in [A-Za-z0-9._-], nothing else.
+        for evil in [
+            "a\x00b",       # NUL byte
+            "a\nb",         # newline
+            "a\rb",         # CR
+            "a\tb",         # tab
+            "a\x1bb",       # ESC (ANSI-escape smuggling)
+            "a\x7fb",       # DEL
+            "\x00\x00\x00", # all-NUL
+        ]:
+            with self.subTest(evil=evil):
+                out = rb.safe_filename_segment(evil)
+                for c in out:
+                    self.assertTrue(
+                        c.isascii(),
+                        f"non-ASCII char {c!r} (U+{ord(c):04X}) in sanitised output {out!r} from input {evil!r}",
+                    )
+                    self.assertGreaterEqual(
+                        ord(c), 0x20,
+                        f"control char U+{ord(c):04X} in sanitised output {out!r} from input {evil!r}",
+                    )
+                    self.assertIn(
+                        c, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-",
+                        f"disallowed char {c!r} in sanitised output {out!r} from input {evil!r}",
+                    )
+
+    def test_unicode_replaced_not_preserved(self):
+        # Python 3's re.sub on the ASCII-only class [A-Za-z0-9._-]
+        # replaces non-ASCII codepoints (they don't match the safe set).
+        # Result: no codepoint above U+007F survives. Model names shared
+        # across ecosystems sometimes carry accented characters or CJK
+        # names — those should map to dashes, not travel through as-is.
+        for unicode_input in ["model-é", "中文", "мoдель", "🚀-fast"]:
+            with self.subTest(unicode_input=unicode_input):
+                out = rb.safe_filename_segment(unicode_input)
+                for c in out:
+                    self.assertLessEqual(
+                        ord(c), 0x7F,
+                        f"non-ASCII codepoint U+{ord(c):04X} survived in {out!r}",
+                    )
+
 
 class FilenameContainmentTests(unittest.TestCase):
     # The end-to-end property: joining `Path(output_dir) /
@@ -203,6 +258,68 @@ class ResponseCapTests(unittest.TestCase):
         )
         self.assertEqual(result.prompt_tokens, 5)
         self.assertEqual(result.completion_tokens, 10)
+        # completion_tokens=10 with a non-zero elapsed interval must
+        # yield a positive tpot_ms — the arithmetic at run_benchmark.py:
+        # `(end - first_byte) * 1000 / completion_tokens`. A zero tpot_ms
+        # in the positive path would mean either the division was
+        # skipped or the timer measured negative time, both of which
+        # need to be caught here rather than in the aggregated
+        # percentile output where the value is folded into a p50.
+        self.assertGreater(
+            result.tpot_ms, 0,
+            f"tpot_ms must be positive when completion_tokens>0 and the response was successful; got {result.tpot_ms}",
+        )
+
+    def test_malformed_json_produces_failure_not_silent_success(self):
+        # The `except (URLError, TimeoutError, json.JSONDecodeError,
+        # ValueError)` clause in make_request has a JSONDecodeError
+        # branch that never fires against a real endpoint returning
+        # good JSON. But it's the error path for the response-cap fix:
+        # a truncated body from a rogue endpoint is exactly what
+        # produces malformed JSON, and the cap + this branch have to
+        # agree — a cap that silently passes junk through would be
+        # worse than no cap. Pin that a body of garbage bytes flows
+        # into success=False with the parser error surfaced in `error`.
+        garbage = b"<html>Bad Gateway</html>this is not json"
+
+        class FakeResp:
+            def __init__(self):
+                self._pos = 0
+
+            def read(self, n=None):
+                if n is None:
+                    n = len(garbage)
+                out = garbage[self._pos: self._pos + n]
+                self._pos += len(out)
+                return out
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        original = rb.urlopen
+        rb.urlopen = lambda *a, **kw: FakeResp()
+        try:
+            result = rb.make_request("http://fake", "test-model", "hello")
+        finally:
+            rb.urlopen = original
+
+        self.assertFalse(
+            result.success,
+            f"non-JSON body must yield success=False, got success=True",
+        )
+        # The error string must be informative — Python's JSONDecodeError
+        # str() is of the shape "Expecting value: line 1 column 1 (char
+        # 0)". Assert one of the diagnostic keywords so a future
+        # refactor that catches and reformats the error can't silently
+        # replace it with something opaque like "request failed".
+        err_lower = result.error.lower()
+        self.assertTrue(
+            any(k in err_lower for k in ("json", "expecting", "decode")),
+            f"malformed-JSON error must name the failure class; got: {result.error!r}",
+        )
 
 
 if __name__ == "__main__":
