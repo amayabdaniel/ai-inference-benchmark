@@ -322,5 +322,84 @@ class ResponseCapTests(unittest.TestCase):
         )
 
 
+class AggregateResultsTpotFilterTests(unittest.TestCase):
+    # The claim this pins:
+    #
+    # run_benchmark.py:292 inside aggregate_results reads
+    #   `tpots = [r.tpot_ms for r in successful if r.tpot_ms > 0]`
+    #
+    # which silently drops any RequestResult whose tpot_ms is 0
+    # (the dataclass default — fired when completion_tokens==0 at
+    # make_request:168-169 skips the division). The filter is the
+    # reason the comment on test_make_request_accepts_body_under_cap
+    # above ("value is folded into a p50") does NOT come true in the
+    # aggregate: without the filter, zero-tpot results WOULD land
+    # inside the percentile sort. Nothing in the suite before this
+    # pinned that filter, so a refactor removing the `if r.tpot_ms
+    # > 0` clause would silently change every reported tpot_p50_ms
+    # on runs that include zero-completion-token responses (safety
+    # refusals, empty answers with HTTP 200 + valid JSON) and no
+    # test would catch it. Debt class: declared-but-inert — the
+    # filter is declared in code and load-bearing for the shipped
+    # claim, but inert as far as the test harness could tell.
+
+    def _mk_result(self, tpot_ms, completion_tokens=10):
+        r = rb.RequestResult()
+        r.success = True
+        r.tpot_ms = tpot_ms
+        r.completion_tokens = completion_tokens
+        r.total_tokens = completion_tokens + 5
+        r.total_ms = 100.0
+        r.ttft_ms = 20.0
+        return r
+
+    def test_zero_tpot_filtered_from_p50(self):
+        # Mixed zero + positive. If the filter is present (correct),
+        # percentile([10, 20, 30], 50) = 20.0.
+        # If the filter is removed (red-verify mutation), the input
+        # becomes [0, 10, 20, 30]; percentile for 50 is
+        # sorted[1] + 0.5 * (sorted[2] - sorted[1]) = 10 + 5 = 15.0.
+        # The mutation is a single-line drop of the `if r.tpot_ms > 0`
+        # clause — compiles trivially, exercises exactly the invariant
+        # under test, and no other guard in this file trips on it.
+        results = [
+            self._mk_result(0.0, completion_tokens=0),
+            self._mk_result(10.0),
+            self._mk_result(20.0),
+            self._mk_result(30.0),
+        ]
+        bench = rb.aggregate_results(results, "latency", concurrency=1)
+        self.assertEqual(
+            bench.tpot_p50_ms, 20.0,
+            f"filter must exclude zero tpot_ms from the p50 computation; "
+            f"got {bench.tpot_p50_ms} on inputs [0, 10, 20, 30] "
+            f"(a filter-removed mutation would produce 15.0)",
+        )
+
+    def test_all_zero_tpot_yields_zero_p50_without_computation(self):
+        # Belt companion to the filter guard: if EVERY successful
+        # result has tpot_ms=0 (e.g. a run against an endpoint that
+        # returns empty completions), the filter produces an empty
+        # tpots list, the `if tpots:` guard at
+        # run_benchmark.py:315 skips the assignment, and
+        # tpot_p50_ms stays at the dataclass default 0. Pin that
+        # this does NOT raise a divide-by-zero or produce a
+        # nonsense value from percentile([], 50).
+        results = [self._mk_result(0.0, completion_tokens=0) for _ in range(4)]
+        bench = rb.aggregate_results(results, "latency", concurrency=1)
+        self.assertEqual(
+            bench.tpot_p50_ms, 0.0,
+            f"all-zero tpot must yield tpot_p50_ms=0 (default); "
+            f"got {bench.tpot_p50_ms}",
+        )
+        # error_count is counted from success=False only; zero-tpot
+        # successful requests are NOT errors by this metric. Pinning
+        # that so a future change that reclassifies zero-tpot as an
+        # error surfaces here rather than silently changing
+        # error_rate across every historic dashboard.
+        self.assertEqual(bench.error_count, 0)
+        self.assertEqual(bench.error_rate, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
