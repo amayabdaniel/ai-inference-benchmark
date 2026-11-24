@@ -322,6 +322,84 @@ class ResponseCapTests(unittest.TestCase):
         )
 
 
+class AggregateResultsTtftFilterTests(unittest.TestCase):
+    # Sibling of AggregateResultsTpotFilterTests below for the OTHER
+    # filter in aggregate_results:
+    #
+    # run_benchmark.py:290 inside aggregate_results reads
+    #   `ttfts = [r.ttft_ms for r in successful if r.ttft_ms > 0]`
+    #
+    # which silently drops any RequestResult whose ttft_ms is 0 (the
+    # dataclass default). This matters because a RequestResult with
+    # success=True but ttft_ms=0 is reachable — a fixture or a mock
+    # response that doesn't set the timer, a future refactor that
+    # moves the ttft assignment into a conditional branch, an endpoint
+    # whose first-byte perf-counter reading happens to equal `start`
+    # at float precision — each produces a zero that must not pollute
+    # the TTFT percentile sort. The guard IS in the code; nothing in
+    # the harness pinned it before this commit, so a refactor dropping
+    # the `if r.ttft_ms > 0` clause would silently change every
+    # reported ttft_p50/95/99 on runs that include zero-ttft results
+    # and no test would catch it. Debt class: declared-but-inert, same
+    # as the tpot filter sibling below.
+
+    def _mk_result(self, ttft_ms, completion_tokens=10):
+        r = rb.RequestResult()
+        r.success = True
+        r.ttft_ms = ttft_ms
+        r.completion_tokens = completion_tokens
+        r.total_tokens = completion_tokens + 5
+        r.total_ms = 100.0
+        r.tpot_ms = 8.0  # non-zero so the tpot filter is not tripped
+        return r
+
+    def test_zero_ttft_filtered_from_p50(self):
+        # Mixed zero + positive. If the filter is present (correct),
+        # percentile([20, 40, 60], 50) = 40.0.
+        # If the filter is removed (red-verify mutation), the input
+        # becomes [0, 20, 40, 60]; percentile for 50 is
+        # sorted[1] + 0.5 * (sorted[2] - sorted[1]) = 20 + 0.5*20 = 30.0.
+        # The mutation is a single-line drop of the `if r.ttft_ms > 0`
+        # clause — compiles trivially, exercises exactly the invariant
+        # under test, and no other guard in this file trips on it
+        # (the tpot filter's own tests set ttft_ms = 20.0 to keep the
+        # ttft filter untripped — see _mk_result in TpotFilterTests).
+        results = [
+            self._mk_result(0.0),
+            self._mk_result(20.0),
+            self._mk_result(40.0),
+            self._mk_result(60.0),
+        ]
+        bench = rb.aggregate_results(results, "latency", concurrency=1)
+        self.assertEqual(
+            bench.ttft_p50_ms, 40.0,
+            f"filter must exclude zero ttft_ms from the p50 computation; "
+            f"got {bench.ttft_p50_ms} on inputs [0, 20, 40, 60] "
+            f"(a filter-removed mutation would produce 30.0)",
+        )
+
+    def test_all_zero_ttft_yields_zero_p50_without_computation(self):
+        # Belt companion: if EVERY successful result has ttft_ms=0
+        # (e.g. a run against a mock endpoint that never populates the
+        # first-byte timer), the filter produces an empty ttfts list,
+        # the `if ttfts:` guard at run_benchmark.py:305 skips the
+        # assignment, and ttft_p50_ms stays at the dataclass default
+        # 0. Pin that this does NOT raise or produce a nonsense value
+        # from percentile([], 50) (which returns 0 via the early-return
+        # at run_benchmark.py:184).
+        results = [self._mk_result(0.0) for _ in range(4)]
+        bench = rb.aggregate_results(results, "latency", concurrency=1)
+        self.assertEqual(
+            bench.ttft_p50_ms, 0.0,
+            f"all-zero ttft must yield ttft_p50_ms=0 (default); "
+            f"got {bench.ttft_p50_ms}",
+        )
+        # error_count is counted from success=False only; zero-ttft
+        # successful requests are NOT errors by this metric.
+        self.assertEqual(bench.error_count, 0)
+        self.assertEqual(bench.error_rate, 0)
+
+
 class AggregateResultsTpotFilterTests(unittest.TestCase):
     # The claim this pins:
     #
