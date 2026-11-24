@@ -330,18 +330,35 @@ class AggregateResultsTtftFilterTests(unittest.TestCase):
     #   `ttfts = [r.ttft_ms for r in successful if r.ttft_ms > 0]`
     #
     # which silently drops any RequestResult whose ttft_ms is 0 (the
-    # dataclass default). This matters because a RequestResult with
-    # success=True but ttft_ms=0 is reachable — a fixture or a mock
-    # response that doesn't set the timer, a future refactor that
-    # moves the ttft assignment into a conditional branch, an endpoint
-    # whose first-byte perf-counter reading happens to equal `start`
-    # at float precision — each produces a zero that must not pollute
-    # the TTFT percentile sort. The guard IS in the code; nothing in
-    # the harness pinned it before this commit, so a refactor dropping
-    # the `if r.ttft_ms > 0` clause would silently change every
-    # reported ttft_p50/95/99 on runs that include zero-ttft results
-    # and no test would catch it. Debt class: declared-but-inert, same
-    # as the tpot filter sibling below.
+    # dataclass default). The zero case is NOT currently production-
+    # reachable: in make_request at run_benchmark.py:143-175, the
+    # ttft_ms assignment at :165 and `success = True` at :171 sit in
+    # the same try block with no branch between them, and the except
+    # handler at :175 sets success = False, so success=True implies
+    # ttft_ms was assigned a positive value. The ttft filter is
+    # DEFENSIVE-REACHABLE only — it catches a test fixture that
+    # constructs RequestResult() directly (the _mk_result helper
+    # below is exactly that), a future refactor that decouples the
+    # timer from the success flag, or a float-precision edge where
+    # first_byte == start.
+    #
+    # Classification correction per orchestrator [9c3280] 2026-11-24
+    # review of commit c67cd90, whose body incorrectly asserted that
+    # ttft shared tpot's production-reachable zero path. The real
+    # split among the three comprehensions at run_benchmark.py:290-292
+    # is {tpot} vs {ttft, e2e} — tpot's :168 `if completion_tokens
+    # > 0` branch is the one production-reachable zero path; ttft
+    # and e2e are both structurally covered on the success path,
+    # with ttft keeping its belt filter and e2e lacking one. See
+    # feedback_reachability_claim_is_a_measurement.
+    #
+    # Pinning a defensive filter is still correct work: an unpinned
+    # belt gets deleted by a future refactor with no signal, which
+    # is exactly what the M-pre run on fe7f83f demonstrated when
+    # dropping this filter left the 17-test suite green. The debt
+    # class is unchanged — declared-but-inert — but the reader
+    # should know it is belt against the test-and-future surface,
+    # not load-bearing against production today.
 
     def _mk_result(self, ttft_ms, completion_tokens=10):
         r = rb.RequestResult()
